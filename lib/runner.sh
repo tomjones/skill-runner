@@ -150,10 +150,13 @@ run_batch_sequential() {
     fi
 
     # Proactive rate limit check
-    local rl_status rl_reset
-    read -r rl_status rl_reset <<< "$(check_rate_limit "$run_dir")"
+    local rl_status rl_reset rl_util
+    read -r rl_status rl_reset rl_util <<< "$(check_rate_limit "$run_dir")"
     if [[ "$rl_status" == "blocked" || "$rl_status" == "rejected" ]]; then
       log_warn "Rate limit blocked — waiting for reset"
+      wait_for_reset "$rl_reset"
+    elif [[ -n "$rl_util" && "$rl_util" -gt 0 && "$rl_util" -ge "$PAUSE_AT" ]]; then
+      log_warn "Utilization at ${rl_util}% (>= ${PAUSE_AT}%) — pausing until reset"
       wait_for_reset "$rl_reset"
     fi
 
@@ -220,18 +223,33 @@ run_batch_parallel() {
     local effective_max=$max_jobs
     while [[ $active_count -lt $effective_max ]] && [[ $next -lt $queue_len ]]; do
       # Proactive rate limit check before each launch
-      local rl_status rl_reset
-      read -r rl_status rl_reset <<< "$(check_rate_limit "$run_dir")"
+      local rl_status rl_reset rl_util
+      read -r rl_status rl_reset rl_util <<< "$(check_rate_limit "$run_dir")"
 
       if [[ "$rl_status" == "blocked" || "$rl_status" == "rejected" ]]; then
-        log_warn "Rate limit blocked — waiting for reset before launching more"
-        # Let in-flight workers finish, then wait
+        log_warn "Rate limit blocked — waiting for reset"
         wait 2>/dev/null
         active_pids=()
         active_count=0
         wait_for_reset "$rl_reset"
-        effective_max=$max_jobs  # restore full parallelism after reset
+        effective_max=$max_jobs
         continue
+      fi
+
+      # Percentage-based throttling
+      if [[ -n "$rl_util" && "$rl_util" -gt 0 ]]; then
+        if [[ "$rl_util" -ge "$PAUSE_AT" ]]; then
+          log_warn "Utilization at ${rl_util}% (>= ${PAUSE_AT}%) — pausing until reset"
+          wait 2>/dev/null
+          active_pids=()
+          active_count=0
+          wait_for_reset "$rl_reset"
+          effective_max=$max_jobs
+          continue
+        elif [[ "$rl_util" -ge "$THROTTLE_AT" && $effective_max -gt 1 ]]; then
+          log_warn "Utilization at ${rl_util}% (>= ${THROTTLE_AT}%) — throttling to 1 worker"
+          effective_max=1
+        fi
       fi
 
       local inp="${queue[$next]}"
