@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.align import Align
+from rich.columns import Columns
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -368,33 +369,45 @@ def build_display(
         pool_text.append(" empty", style="dim")
     pool_panel = Panel(pool_text, title=f"Pool ({len(pending)})", border_style="dim")
 
-    # Workers panel — reserve last line for overflow indicator
-    worker_text = Text()
-    worker_max = 12
-    worker_show = min(worker_max, len(running))
-    for e in list(running)[:worker_show]:
-        inp = e.get("input", "?")
-        ts = start_time_map.get(inp, "")
-        detail = get_running_detail(run_dir, inp) if run_dir else {}
-        last_tool = detail.get("last_tool", "")
-        elapsed_str = ""
-        if ts:
-            try:
-                started_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                elapsed_secs = max(0, int((datetime.now(tz=timezone.utc) - started_dt).total_seconds()))
-                elapsed_str = format_duration(elapsed_secs)
-            except Exception:
-                pass
-        tool_str = f" {last_tool}" if last_tool else ""
-        worker_text.append(f" {spinner} ", style="yellow")
-        worker_text.append(f"{inp}", style="yellow bold")
-        worker_text.append(f"  {elapsed_str}", style="yellow")
-        worker_text.append(f"{tool_str}\n", style="dim")
-    if len(running) > worker_show:
-        worker_text.append(f" +{len(running) - worker_show} more", style="yellow italic")
-    elif not running:
-        worker_text.append(" idle", style="dim")
-    worker_panel = Panel(worker_text, title=f"Workers ({n_running})", border_style="yellow" if running else "dim")
+    # Workers panel — card slots for each -j worker
+    max_workers = meta.get("parallel", 1)
+    running_list = list(running)
+
+    card_width = 24  # fixed width for all cards
+    cards = []
+    for i in range(max_workers):
+        if i < len(running_list):
+            e = running_list[i]
+            inp = e.get("input", "?")
+            ts = start_time_map.get(inp, "")
+            elapsed_str = ""
+            if ts:
+                try:
+                    started_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    elapsed_secs = max(0, int((datetime.now(tz=timezone.utc) - started_dt).total_seconds()))
+                    elapsed_str = format_duration(elapsed_secs)
+                except Exception:
+                    pass
+            t = Text()
+            t.append(f"{spinner} ", style="yellow")
+            # Truncate registration only if needed to fit timer
+            inner_width = card_width - 4  # minus borders + padding
+            timer_len = len(elapsed_str) + 1 if elapsed_str else 0
+            name_max = inner_width - timer_len - 2  # 2 for spinner
+            name = inp if len(inp) <= name_max else inp[-(name_max):]
+            t.append(name, style="yellow bold")
+            if elapsed_str:
+                t.append(f" {elapsed_str}", style="yellow")
+            cards.append(Panel(t, border_style="yellow", width=card_width, height=3))
+        else:
+            t = Text("idle", style="dim")
+            cards.append(Panel(t, border_style="grey30", width=card_width, height=3))
+
+    worker_panel = Panel(
+        Columns(cards, equal=False, expand=False, padding=(0, 0)),
+        title=f"Workers ({n_running}/{max_workers})",
+        border_style="yellow" if running else "dim",
+    )
 
     # -- Right side: Defrag grid --
     # Overshoot capacity — Rich clips at panel edge, so more is fine
@@ -486,7 +499,7 @@ def build_display(
     work_layout = Layout()
     work_layout.split_row(
         Layout(pool_panel, name="pool", ratio=1),
-        Layout(worker_panel, name="workers", ratio=1),
+        Layout(worker_panel, name="workers", ratio=2),
         Layout(grid_panel, name="grid", ratio=2),
     )
 
