@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Core execution loop — runs claude -p for each input
+# Core execution loop — runs claude -p for each input (sequential or parallel)
 
 # Live stream filter — shows condensed claude activity on the terminal
 # Reads stream-json lines, extracts tool use and text output
@@ -93,9 +93,6 @@ run_one() {
     fi
   fi
 
-  local duration_fmt
-  duration_fmt=$(format_duration "$duration")
-
   if [[ "$is_error" == "true" ]] || [[ $exit_code -ne 0 ]]; then
     mark_status "$run_dir" "$input" "failed" "$cost" "$turns" "$duration" "$session"
     return 1
@@ -105,52 +102,142 @@ run_one() {
   fi
 }
 
-run_batch() {
+# Worker wrapper — runs one input with logging and sounds
+_run_worker() {
+  local input="$1" run_dir="$2" idx="$3" total="$4"
+
+  log_info "[$idx/$total] Running: $input"
+  mark_status "$run_dir" "$input" "running" "0" "0" "0" ""
+  sound_task_starting
+
+  if run_one "$input" "$run_dir"; then
+    local last_cost last_turns last_dur
+    last_cost=$(grep "\"input\":\"${input}\".*\"completed\"" "$run_dir/progress.jsonl" | tail -1 | jq -r '.cost_usd // 0' 2>/dev/null || echo "0")
+    last_turns=$(grep "\"input\":\"${input}\".*\"completed\"" "$run_dir/progress.jsonl" | tail -1 | jq -r '.turns // 0' 2>/dev/null || echo "0")
+    last_dur=$(grep "\"input\":\"${input}\".*\"completed\"" "$run_dir/progress.jsonl" | tail -1 | jq -r '.duration_s // 0' 2>/dev/null || echo "0")
+    log_success "[$idx/$total] DONE: $input  (${last_turns} turns, $(format_duration "$last_dur"), \$${last_cost})"
+    sound_task_completed
+  else
+    log_error "[$idx/$total] FAILED: $input"
+    sound_task_failed
+  fi
+}
+
+# ── Sequential batch (default, -j 1) ───────────────────────────────────
+run_batch_sequential() {
   local run_dir="$1"
   local inputs_file="$run_dir/inputs.txt"
   local total
   total=$(wc -l < "$inputs_file" | tr -d '[:space:]')
-  local current=0 completed=0 failed=0
-
-  # Pre-count already completed (for resume)
-  completed=$(get_completed_count "$run_dir")
-
-  log_info "Starting batch: $total inputs, $completed already completed"
-  sound_run_started
-  echo ""
+  local current=0
 
   while IFS= read -r input || [[ -n "$input" ]]; do
-    # Skip empty lines
     [[ -z "$input" ]] && continue
-
     current=$((current + 1))
 
-    # Skip if already completed (resume)
     if is_completed "$run_dir" "$input"; then
       log_dim "[$current/$total] SKIP $input (already completed)"
       continue
     fi
 
-    log_info "[$current/$total] Running: $input"
-    mark_status "$run_dir" "$input" "running" "0" "0" "0" ""
-    sound_task_starting
-
-    if run_one "$input" "$run_dir"; then
-      completed=$((completed + 1))
-      local last_cost last_turns last_dur
-      last_cost=$(tail -1 "$run_dir/progress.jsonl" | jq -r '.cost_usd // 0')
-      last_turns=$(tail -1 "$run_dir/progress.jsonl" | jq -r '.turns // 0')
-      last_dur=$(tail -1 "$run_dir/progress.jsonl" | jq -r '.duration_s // 0')
-      log_success "[$current/$total] DONE: $input  (${last_turns} turns, $(format_duration "$last_dur"), \$${last_cost})"
-      sound_task_completed
-    else
-      failed=$((failed + 1))
-      log_error "[$current/$total] FAILED: $input"
-      sound_task_failed
-    fi
+    _run_worker "$input" "$run_dir" "$current" "$total"
 
   done < "$inputs_file"
+}
 
+# ── Parallel batch (-j N where N > 1) ──────────────────────────────────
+run_batch_parallel() {
+  local run_dir="$1" max_jobs="$2"
+  local inputs_file="$run_dir/inputs.txt"
+  local total
+  total=$(wc -l < "$inputs_file" | tr -d '[:space:]')
+
+  # Build queue of inputs to process (skip completed)
+  local -a queue=()
+  local -a queue_idx=()
+  local current=0
+  while IFS= read -r input || [[ -n "$input" ]]; do
+    [[ -z "$input" ]] && continue
+    current=$((current + 1))
+    if is_completed "$run_dir" "$input"; then
+      log_dim "[$current/$total] SKIP $input (already completed)"
+      continue
+    fi
+    queue+=("$input")
+    queue_idx+=("$current")
+  done < "$inputs_file"
+
+  local queue_len=${#queue[@]}
+  if [[ $queue_len -eq 0 ]]; then
+    log_info "Nothing to process"
+    return
+  fi
+
+  log_info "Processing $queue_len inputs with $max_jobs parallel workers"
+
+  local -a active_pids=()
+  local next=0
+  local active_count=0
+
+  while [[ $next -lt $queue_len ]] || [[ $active_count -gt 0 ]]; do
+    # Recount active workers (prune dead PIDs)
+    local -a still_alive=()
+    active_count=0
+    for p in "${active_pids[@]}"; do
+      [[ -z "$p" ]] && continue
+      if kill -0 "$p" 2>/dev/null; then
+        still_alive+=("$p")
+        active_count=$((active_count + 1))
+      fi
+    done
+    active_pids=("${still_alive[@]+"${still_alive[@]}"}")
+
+    # Launch workers up to max_jobs
+    while [[ $active_count -lt $max_jobs ]] && [[ $next -lt $queue_len ]]; do
+      local inp="${queue[$next]}"
+      local idx="${queue_idx[$next]}"
+      next=$((next + 1))
+
+      _run_worker "$inp" "$run_dir" "$idx" "$total" &
+      active_pids+=("$!")
+      CHILD_PIDS+=("$!")
+      active_count=$((active_count + 1))
+
+      # Stagger launches for cache efficiency
+      sleep 2
+    done
+
+    # Poll interval
+    sleep 2
+  done
+
+  # Wait for any remaining workers
+  wait 2>/dev/null
+}
+
+# ── Entry point ─────────────────────────────────────────────────────────
+run_batch() {
+  local run_dir="$1"
+  local parallel="${2:-1}"
+  local inputs_file="$run_dir/inputs.txt"
+  local total
+  total=$(wc -l < "$inputs_file" | tr -d '[:space:]')
+  local completed
+  completed=$(get_completed_count "$run_dir")
+
+  log_info "Starting batch: $total inputs, $completed already completed, $parallel parallel"
+  sound_run_started
+  echo ""
+
+  if [[ "$parallel" -le 1 ]]; then
+    run_batch_sequential "$run_dir"
+  else
+    run_batch_parallel "$run_dir" "$parallel"
+  fi
+
+  completed=$(get_completed_count "$run_dir")
+  local failed
+  failed=$(get_failed_count "$run_dir")
   log_info "Batch complete: $completed completed, $failed failed out of $total"
   sound_batch_complete
 }

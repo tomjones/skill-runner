@@ -22,6 +22,7 @@ EFFORT="${SKILL_EFFORT:-$EFFORT}"
 SOUNDS_ENABLED="${SKILL_SOUNDS:-false}"
 MAX_TURNS="${SKILL_MAX_TURNS:-$MAX_TURNS}"
 ALLOWED_TOOLS="${SKILL_ALLOWED_TOOLS:-$ALLOWED_TOOLS}"
+PARALLEL="${SKILL_PARALLEL:-1}"
 
 # ── Parse CLI args ──────────────────────────────────────────────────────
 SKILL=""
@@ -51,6 +52,7 @@ Overrides (optional, override .env):
   --resume                 Resume most recent run for this skill
   --dry-run                Show what would run without executing
   --sounds                 Enable Mario sound effects
+  --parallel N, -j N       Run N inputs in parallel (default: 1)
   --help                   Show this help
 
 Examples:
@@ -73,10 +75,11 @@ while [[ $# -gt 0 ]]; do
     --resume)         RESUME=true; shift ;;
     --dry-run)        DRY_RUN=true; shift ;;
     --sounds)         SOUNDS_ENABLED=true; shift ;;
+    --parallel|-j)    PARALLEL="$2"; shift 2 ;;
     --help|-h)        show_usage; exit 0 ;;
     --input)
       shift
-      while [[ $# -gt 0 ]] && [[ "$1" != --* ]]; do
+      while [[ $# -gt 0 ]] && [[ "$1" != -* ]]; do
         INPUTS+=("$1")
         shift
       done
@@ -198,6 +201,7 @@ echo "  Workdir:    $WORKDIR"
 echo "  Model:      $MODEL"
 echo "  Effort:     $EFFORT"
 echo "  Max turns:  $MAX_TURNS"
+echo "  Parallel:   $PARALLEL"
 echo "  ────────────────────────────────────"
 echo "  Inputs:     $TOTAL_INPUTS"
 [[ "$ALREADY_DONE" -gt 0 ]] && echo "  Completed:  $ALREADY_DONE (will skip)"
@@ -234,9 +238,10 @@ echo ""
 log_info "Run started"
 
 # Trap Ctrl+C for clean summary
-trap 'echo ""; log_warn "Interrupted — printing summary"; sound_interrupted; print_summary "$RUN_DIR"; exit 130' INT
+CHILD_PIDS=()
+trap 'echo ""; log_warn "Interrupted — killing workers"; kill "${CHILD_PIDS[@]}" $(jobs -p) 2>/dev/null; wait 2>/dev/null; sound_interrupted; print_summary "$RUN_DIR"; exit 130' INT TERM
 
-run_batch "$RUN_DIR"
+run_batch "$RUN_DIR" "$PARALLEL"
 
 # ── Final summary ───────────────────────────────────────────────────────
 print_summary "$RUN_DIR"
