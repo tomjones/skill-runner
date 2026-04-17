@@ -345,134 +345,150 @@ def build_display(
 
     stats_panel = Panel(stats_text, title="Performance", border_style="blue")
 
-    # -- All inputs table (windowed) --
-    task_table = Table(
-        show_header=True, header_style="bold", expand=True, show_lines=False, padding=(0, 1)
-    )
-    task_table.add_column("#", justify="right", width=4, style="dim")
-    task_table.add_column("", width=2)
-    task_table.add_column("Input", min_width=14)
-    task_table.add_column("Status", width=12)
-    task_table.add_column("Turns", justify="right", width=6)
-    task_table.add_column("Cost", justify="right", width=8)
-    task_table.add_column("Started", justify="right", width=10)
-    task_table.add_column("Finished", justify="right", width=10)
+    # -- Left side: Pool + Workers stacked --
+    spinner_chars = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827"
+    spinner = spinner_chars[int(time.time() * 2) % len(spinner_chars)]
 
-    # Build start time map from "running" entries
     start_time_map: dict[str, str] = {}
     for e in entries:
         if e.get("status") == "running":
             start_time_map[e.get("input", "")] = e.get("timestamp", "")
 
-    # Find focus row (first running or first pending)
-    focus_idx = len(all_inputs) - 1  # default to end
-    for i, inp in enumerate(all_inputs):
+    pending = [inp for inp in all_inputs if status_map.get(inp, {}).get("status") is None]
+
+    # Pool panel — reserve last line for overflow indicator
+    pool_text = Text()
+    pool_max = 12  # conservative so "+N more" is always visible
+    pool_show = min(pool_max, len(pending))
+    for inp in pending[:pool_show]:
+        pool_text.append(f" \u2022 {inp}\n", style="dim")
+    if len(pending) > pool_show:
+        pool_text.append(f" +{len(pending) - pool_show} more", style="dim italic")
+    elif not pending:
+        pool_text.append(" empty", style="dim")
+    pool_panel = Panel(pool_text, title=f"Pool ({len(pending)})", border_style="dim")
+
+    # Workers panel — reserve last line for overflow indicator
+    worker_text = Text()
+    worker_max = 12
+    worker_show = min(worker_max, len(running))
+    for e in list(running)[:worker_show]:
+        inp = e.get("input", "?")
+        ts = start_time_map.get(inp, "")
+        detail = get_running_detail(run_dir, inp) if run_dir else {}
+        last_tool = detail.get("last_tool", "")
+        elapsed_str = ""
+        if ts:
+            try:
+                started_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                elapsed_secs = max(0, int((datetime.now(tz=timezone.utc) - started_dt).total_seconds()))
+                elapsed_str = format_duration(elapsed_secs)
+            except Exception:
+                pass
+        tool_str = f" {last_tool}" if last_tool else ""
+        worker_text.append(f" {spinner} ", style="yellow")
+        worker_text.append(f"{inp}", style="yellow bold")
+        worker_text.append(f"  {elapsed_str}", style="yellow")
+        worker_text.append(f"{tool_str}\n", style="dim")
+    if len(running) > worker_show:
+        worker_text.append(f" +{len(running) - worker_show} more", style="yellow italic")
+    elif not running:
+        worker_text.append(" idle", style="dim")
+    worker_panel = Panel(worker_text, title=f"Workers ({n_running})", border_style="yellow" if running else "dim")
+
+    # -- Right side: Defrag grid --
+    # Overshoot capacity — Rich clips at panel edge, so more is fine
+    # 200 wide x 30 tall = 6000 covers any terminal size
+    grid_capacity = 6000
+
+    # If all tasks fit, show everything + empty dot padding
+    if total_inputs <= grid_capacity:
+        grid_start = 0
+        grid_end = total_inputs
+        hidden_above_grid = 0
+        hidden_below_grid = 0
+        fill_remaining = True
+    else:
+        # Auto-scroll window: find first running/pending, show context around it
+        focus = 0
+        for i, inp in enumerate(all_inputs):
+            s = status_map.get(inp, {}).get("status")
+            if s in ("running", None):
+                focus = i
+                break
+
+        # Show ~2 rows of completed above focus, rest below
+        context = min(130, focus)  # ~2 rows of context
+        grid_start = max(0, focus - context)
+        grid_end = min(total_inputs, grid_start + grid_capacity)
+        if grid_end == total_inputs:
+            grid_start = max(0, grid_end - grid_capacity)
+        hidden_above_grid = grid_start
+        hidden_below_grid = max(0, total_inputs - grid_end)
+        fill_remaining = True
+
+    grid_blocks = Text(overflow="fold")
+
+    # Scroll-up indicator
+    if hidden_above_grid > 0:
+        indicator = f" \u2191 {hidden_above_grid:,} completed above "
+        grid_blocks.append(indicator, style="bold cyan")
+        # Pad rest of first line with dots so it doesn't break the grid
+        pad_len = max(0, 60 - len(indicator))
+        grid_blocks.append("\u00b7" * pad_len, style="grey30")
+
+    # Render visible window
+    anim_tick = int(time.time() * 3)
+    for i in range(grid_start, grid_end):
+        inp = all_inputs[i]
         s = status_map.get(inp, {}).get("status")
-        if s == "running" or s is None:  # None = pending (not in status_map)
-            focus_idx = i
-            break
-
-    # Window: show ~10 visible rows, with 3 completed above the focus
-    visible_rows = 10
-    context_above = min(3, focus_idx)
-    start = max(0, focus_idx - context_above)
-    end = min(len(all_inputs), start + visible_rows)
-    if end == len(all_inputs):
-        start = max(0, end - visible_rows)
-
-    hidden_above = start
-    hidden_below = len(all_inputs) - end
-
-    # Scroll indicator: above
-    if hidden_above > 0:
-        task_table.add_row(
-            "", "", f"[dim]\u2191 {hidden_above} completed above[/dim]",
-            "", "", "", "", "",
-        )
-
-    # Render windowed rows
-    for idx in range(start, end):
-        inp = all_inputs[idx]
-        row_num = idx + 1
-        e = status_map.get(inp)
-
-        if e is None:
-            task_table.add_row(
-                str(row_num), "[dim]\u2022[/dim]", f"[dim]{inp}[/dim]",
-                "[dim]pending[/dim]", "", "", "", "",
-            )
-            continue
-
-        status = e.get("status", "?")
-        ts = e.get("timestamp", "")
-        started_ts = start_time_map.get(inp, "")
-        started_str = started_ts[11:19] if len(started_ts) >= 19 else ""
-        finished_str = ts[11:19] if len(ts) >= 19 else ""
-
-        if status == "completed":
-            icon = "[green]\u2713[/green]"
-            status_text = "[green]completed[/green]"
-            task_table.add_row(
-                str(row_num), icon, inp, status_text,
-                str(e.get("turns", 0)),
-                f"${e.get('cost_usd', 0):.4f}",
-                started_str,
-                finished_str,
-            )
-        elif status == "failed":
-            icon = "[red]\u2717[/red]"
-            status_text = "[red]failed[/red]"
-            task_table.add_row(
-                str(row_num), icon, f"[red]{inp}[/red]", status_text,
-                str(e.get("turns", 0)),
-                f"${e.get('cost_usd', 0):.4f}",
-                started_str,
-                f"[red]{finished_str}[/red]",
-            )
-        elif status == "running":
-            spinner_chars = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827"
-            spinner = spinner_chars[int(time.time() * 2) % len(spinner_chars)]
-            icon = f"[yellow]{spinner}[/yellow]"
-            detail = get_running_detail(run_dir, inp) if run_dir else {}
-            live_turns = detail.get("turns", 0)
-            last_tool = detail.get("last_tool", "")
-            tool_text = f" [dim]({last_tool})[/dim]" if last_tool else ""
-            status_text = f"[yellow bold]running[/yellow bold]{tool_text}"
-            # Live elapsed in Finished column
-            elapsed_str = ""
-            if started_ts:
-                try:
-                    started_dt = datetime.fromisoformat(started_ts.replace("Z", "+00:00"))
-                    elapsed_secs = max(0, int((datetime.now(tz=timezone.utc) - started_dt).total_seconds()))
-                    elapsed_str = f"[yellow]{format_duration(elapsed_secs)}[/yellow]"
-                except Exception:
-                    elapsed_str = "[yellow]...[/yellow]"
-            task_table.add_row(
-                str(row_num), icon, f"[yellow]{inp}[/yellow]", status_text,
-                str(live_turns) if live_turns else "",
-                "",
-                started_str,
-                elapsed_str,
-            )
-        elif status == "paused":
-            icon = "[yellow]\u23f8[/yellow]"
-            task_table.add_row(
-                str(row_num), icon, f"[yellow]{inp}[/yellow]",
-                "[yellow]rate limited[/yellow]", "", "", started_str, "",
-            )
+        if s == "completed":
+            grid_blocks.append("\u2588", style="green")
+        elif s == "running":
+            # Independent animation per block — hash of input name as phase offset
+            phase = hash(inp) % 6
+            wave_chars = "\u2588\u2593\u2592\u2591\u2592\u2593"
+            char = wave_chars[(anim_tick + phase) % len(wave_chars)]
+            grid_blocks.append(char, style="yellow")
+        elif s == "failed":
+            grid_blocks.append("\u2588", style="red")
+        elif s == "paused":
+            grid_blocks.append("\u2588", style="yellow dim")
         else:
-            task_table.add_row(
-                str(row_num), " ", inp, status, "", "", "", "",
-            )
+            grid_blocks.append("\u2591", style="dim")
 
-    # Scroll indicator: below
-    if hidden_below > 0:
-        task_table.add_row(
-            "", "", f"[dim]\u2193 {hidden_below} more below[/dim]",
-            "", "", "", "", "",
-        )
+    # Fill remaining space with empty dots
+    if fill_remaining:
+        fill_count = max(0, grid_capacity - (grid_end - grid_start))
+        grid_blocks.append("\u00b7" * fill_count, style="grey30")
 
-    task_panel = Panel(task_table, title=f"Tasks ({n_done}/{total_inputs})", border_style="blue")
+    # Scroll-down indicator (embedded at end)
+    if hidden_below_grid > 0:
+        grid_blocks.append(f" \u2193 {hidden_below_grid:,} more below ", style="bold cyan")
+
+    legend = Text.from_markup(
+        " [green]\u2588[/green] [dim]done[/dim]  "
+        "[yellow]\u2588[/yellow] [dim]running[/dim]  "
+        "[red]\u2588[/red] [dim]failed[/dim]  "
+        "[dim]\u2591 pending[/dim]  "
+        "[grey30]\u00b7[/grey30] [dim]empty[/dim]"
+    )
+
+    grid_inner = Layout()
+    grid_inner.split_column(
+        Layout(grid_blocks, name="blocks"),
+        Layout(legend, name="legend", size=1),
+    )
+
+    grid_panel = Panel(grid_inner, title=f"Tasks ({n_done}/{total_inputs})", border_style="blue")
+
+    # Side by side: pool | workers | defrag
+    work_layout = Layout()
+    work_layout.split_row(
+        Layout(pool_panel, name="pool", ratio=1),
+        Layout(worker_panel, name="workers", ratio=1),
+        Layout(grid_panel, name="grid", ratio=2),
+    )
 
     # -- Live log terminal --
     visible_log_lines = 12
@@ -521,7 +537,7 @@ def build_display(
         Layout(progress_panel, name="progress", size=7),
         Layout(stats_panel, name="stats", size=5),
         Layout(usage_panel, name="usage", size=usage_height),
-        Layout(task_panel, name="tasks"),
+        Layout(work_layout, name="work"),
         Layout(log_panel, name="log", size=15),
     )
 
