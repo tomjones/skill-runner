@@ -80,13 +80,17 @@ run_one() {
   end_time=$(date +%s)
   duration=$((end_time - start_time))
 
-  # Parse result from stream-json (each line is a JSON object, find the result line)
+  # Parse result from stream-json (take LAST result event — there can be multiple)
   local cost="0" turns="0" session="" is_error="false"
   if [[ $exit_code -eq 0 ]] && [[ -s "$result_file" ]]; then
-    cost=$(grep '"type":"result"' "$result_file" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo "0")
-    turns=$(grep '"type":"result"' "$result_file" | jq -r '.num_turns // 0' 2>/dev/null || echo "0")
-    session=$(grep '"type":"result"' "$result_file" | jq -r '.session_id // ""' 2>/dev/null || echo "")
-    is_error=$(grep '"type":"result"' "$result_file" | jq -r '.is_error // false' 2>/dev/null || echo "false")
+    local result_line
+    result_line=$(grep '"type":"result"' "$result_file" | tail -1)
+    if [[ -n "$result_line" ]]; then
+      cost=$(echo "$result_line" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo "0")
+      turns=$(echo "$result_line" | jq -r '.num_turns // 0' 2>/dev/null || echo "0")
+      session=$(echo "$result_line" | jq -r '.session_id // ""' 2>/dev/null || echo "")
+      is_error=$(echo "$result_line" | jq -r '.is_error // false' 2>/dev/null || echo "false")
+    fi
   fi
 
   local duration_fmt

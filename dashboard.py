@@ -316,8 +316,9 @@ def build_display(
 
     runtime_str = format_duration(total_duration)
 
+    cost_str = f"${total_cost:.4f}"
     stats_text = (
-        f"  API equiv:     ${total_cost:.4f}         Avg duration: {format_duration(int(avg_duration))}\n"
+        f"  API equiv:     {cost_str:<20}Avg duration: {format_duration(int(avg_duration))}\n"
         f"  Total turns:   {total_turns:<20}Avg turns:    {avg_turns:.1f}\n"
         f"  Total runtime: {runtime_str:<20}Est remaining: {format_duration(eta_secs)}"
     )
@@ -333,9 +334,15 @@ def build_display(
     task_table.add_column("Input", min_width=14)
     task_table.add_column("Status", width=12)
     task_table.add_column("Turns", justify="right", width=6)
-    task_table.add_column("Duration", justify="right", width=10)
     task_table.add_column("Cost", justify="right", width=8)
-    task_table.add_column("Time", justify="right", width=10)
+    task_table.add_column("Started", justify="right", width=10)
+    task_table.add_column("Finished", justify="right", width=10)
+
+    # Build start time map from "running" entries
+    start_time_map: dict[str, str] = {}
+    for e in entries:
+        if e.get("status") == "running":
+            start_time_map[e.get("input", "")] = e.get("timestamp", "")
 
     # Find focus row (first running or first pending)
     focus_idx = len(all_inputs) - 1  # default to end
@@ -378,7 +385,9 @@ def build_display(
 
         status = e.get("status", "?")
         ts = e.get("timestamp", "")
-        time_str = ts[11:19] if len(ts) >= 19 else ts
+        started_ts = start_time_map.get(inp, "")
+        started_str = started_ts[11:19] if len(started_ts) >= 19 else ""
+        finished_str = ts[11:19] if len(ts) >= 19 else ""
 
         if status == "completed":
             icon = "[green]\u2713[/green]"
@@ -386,9 +395,9 @@ def build_display(
             task_table.add_row(
                 str(row_num), icon, inp, status_text,
                 str(e.get("turns", 0)),
-                format_duration(e.get("duration_s", 0)),
                 f"${e.get('cost_usd', 0):.4f}",
-                time_str,
+                started_str,
+                finished_str,
             )
         elif status == "failed":
             icon = "[red]\u2717[/red]"
@@ -396,12 +405,11 @@ def build_display(
             task_table.add_row(
                 str(row_num), icon, f"[red]{inp}[/red]", status_text,
                 str(e.get("turns", 0)),
-                format_duration(e.get("duration_s", 0)),
                 f"${e.get('cost_usd', 0):.4f}",
-                time_str,
+                started_str,
+                f"[red]{finished_str}[/red]",
             )
         elif status == "running":
-            # Animated spinner for running state
             spinner_chars = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827"
             spinner = spinner_chars[int(time.time() * 2) % len(spinner_chars)]
             icon = f"[yellow]{spinner}[/yellow]"
@@ -410,12 +418,21 @@ def build_display(
             last_tool = detail.get("last_tool", "")
             tool_text = f" [dim]({last_tool})[/dim]" if last_tool else ""
             status_text = f"[yellow bold]running[/yellow bold]{tool_text}"
+            # Live elapsed in Finished column
+            elapsed_str = ""
+            if started_ts:
+                try:
+                    started_dt = datetime.fromisoformat(started_ts.replace("Z", "+00:00"))
+                    elapsed_secs = max(0, int((datetime.now(tz=timezone.utc) - started_dt).total_seconds()))
+                    elapsed_str = f"[yellow]{format_duration(elapsed_secs)}[/yellow]"
+                except Exception:
+                    elapsed_str = "[yellow]...[/yellow]"
             task_table.add_row(
                 str(row_num), icon, f"[yellow]{inp}[/yellow]", status_text,
                 str(live_turns) if live_turns else "",
-                "[yellow]...[/yellow]",
                 "",
-                time_str,
+                started_str,
+                elapsed_str,
             )
         else:
             task_table.add_row(
@@ -432,10 +449,15 @@ def build_display(
     task_panel = Panel(task_table, title=f"Tasks ({n_done}/{total_inputs})", border_style="blue")
 
     # -- Live log terminal --
-    log_lines = _read_log_tail(run_dir, max_lines=20)
+    visible_log_lines = 12
+    total_log_lines, log_lines = _read_log_tail(run_dir, max_lines=visible_log_lines)
     log_text = Text()
+
+    hidden_log = total_log_lines - len(log_lines)
+    if hidden_log > 0:
+        log_text.append(f"  \u2191 {hidden_log} lines above\n", style="dim")
+
     for line in log_lines:
-        # Color code log lines
         if "[SUCCESS]" in line:
             log_text.append(line + "\n", style="green")
         elif "[ERROR]" in line:
@@ -445,7 +467,6 @@ def build_display(
         elif "[INFO" in line and "Running:" in line:
             log_text.append(line + "\n", style="cyan")
         elif line.startswith("  ["):
-            # Stream filter lines (tool use / text output)
             if "] tool:" in line:
                 log_text.append(line + "\n", style="dim")
             else:
@@ -453,7 +474,7 @@ def build_display(
         else:
             log_text.append(line + "\n", style="dim")
 
-    if not log_lines:
+    if not log_lines and total_log_lines == 0:
         log_text.append("  Waiting for output...\n", style="dim")
 
     log_panel = Panel(
@@ -481,19 +502,21 @@ def build_display(
     return layout
 
 
-def _read_log_tail(run_dir: Path | None, max_lines: int = 12) -> list[str]:
-    """Read the last N lines from run.log."""
+def _read_log_tail(run_dir: Path | None, max_lines: int = 12) -> tuple[int, list[str]]:
+    """Read the last N lines from run.log. Returns (total_lines, tail_lines)."""
     if run_dir is None:
-        return []
+        return 0, []
     log_file = run_dir / "run.log"
     if not log_file.exists():
-        return []
+        return 0, []
     try:
         text = log_file.read_text()
         lines = text.splitlines()
-        return lines[-max_lines:] if len(lines) > max_lines else lines
+        total = len(lines)
+        tail = lines[-max_lines:] if total > max_lines else lines
+        return total, tail
     except Exception:
-        return []
+        return 0, []
 
 
 def get_usage_from_results(run_dir: Path) -> dict:
