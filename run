@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Source libraries
+source "$SCRIPT_DIR/lib/log.sh"
+source "$SCRIPT_DIR/lib/progress.sh"
+source "$SCRIPT_DIR/lib/runner.sh"
+source "$SCRIPT_DIR/lib/sounds.sh"
+
+# ── Defaults (overridden by .env, then by CLI flags) ────────────────────
+MODEL="opus"
+EFFORT="max"
+MAX_TURNS="20"
+ALLOWED_TOOLS="Bash,Read,Write,Glob,Grep"
+
+# Load .env if present
+[[ -f "$SCRIPT_DIR/.env" ]] && source "$SCRIPT_DIR/.env"
+MODEL="${SKILL_MODEL:-$MODEL}"
+EFFORT="${SKILL_EFFORT:-$EFFORT}"
+SOUNDS_ENABLED="${SKILL_SOUNDS:-false}"
+MAX_TURNS="${SKILL_MAX_TURNS:-$MAX_TURNS}"
+ALLOWED_TOOLS="${SKILL_ALLOWED_TOOLS:-$ALLOWED_TOOLS}"
+
+# ── Parse CLI args ──────────────────────────────────────────────────────
+SKILL=""
+WORKDIR=""
+INPUTS=()
+INPUT_FILE=""
+LIMIT=0
+RESUME=false
+DRY_RUN=false
+
+show_usage() {
+  cat <<'EOF'
+skill-runner — run Claude Code skills against multiple inputs
+
+Usage: ./run --skill <slash-command> --workdir <path> [input source] [overrides]
+
+Input sources (one required):
+  --input VAL1 VAL2 ...   Inline input values
+  --file <path>            Text file with one input per line
+
+Overrides (optional, override .env):
+  --model <model>          opus, sonnet, haiku
+  --effort <level>         low, medium, high, max
+  --max-turns <n>          Cap agentic loop iterations
+  --allowed-tools <list>   Comma-separated tool list
+  --limit <n>              Only process first N inputs
+  --resume                 Resume most recent run for this skill
+  --dry-run                Show what would run without executing
+  --sounds                 Enable Mario sound effects
+  --help                   Show this help
+
+Examples:
+  ./run --skill /analyze-association --workdir ~/foundry-portal --input CR23002026 CR23002027
+  ./run --skill /analyze-association --workdir ~/foundry-portal --file ~/registrations.txt
+  ./run --skill /analyze-association --workdir ~/foundry-portal --resume
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skill)          SKILL="$2"; shift 2 ;;
+    --workdir)        WORKDIR="$2"; shift 2 ;;
+    --file)           INPUT_FILE="$2"; shift 2 ;;
+    --model)          MODEL="$2"; shift 2 ;;
+    --effort)         EFFORT="$2"; shift 2 ;;
+    --max-turns)      MAX_TURNS="$2"; shift 2 ;;
+    --allowed-tools)  ALLOWED_TOOLS="$2"; shift 2 ;;
+    --limit)          LIMIT="$2"; shift 2 ;;
+    --resume)         RESUME=true; shift ;;
+    --dry-run)        DRY_RUN=true; shift ;;
+    --sounds)         SOUNDS_ENABLED=true; shift ;;
+    --help|-h)        show_usage; exit 0 ;;
+    --input)
+      shift
+      while [[ $# -gt 0 ]] && [[ "$1" != --* ]]; do
+        INPUTS+=("$1")
+        shift
+      done
+      ;;
+    *)
+      log_error "Unknown flag: $1"
+      show_usage
+      exit 1
+      ;;
+  esac
+done
+
+# ── Validate ────────────────────────────────────────────────────────────
+if [[ -z "$SKILL" ]]; then
+  log_error "Missing required: --skill"
+  show_usage
+  exit 1
+fi
+
+if [[ -z "$WORKDIR" ]] && [[ "$RESUME" == false ]]; then
+  log_error "Missing required: --workdir"
+  show_usage
+  exit 1
+fi
+
+# Expand ~ in workdir
+WORKDIR="${WORKDIR/#\~/$HOME}"
+
+if [[ -n "$WORKDIR" ]] && [[ ! -d "$WORKDIR" ]]; then
+  log_error "Workdir does not exist: $WORKDIR"
+  exit 1
+fi
+
+# ── Build run directory ─────────────────────────────────────────────────
+RUNS_DIR="$SCRIPT_DIR/runs"
+mkdir -p "$RUNS_DIR"
+
+# Sanitize skill name for directory (strip leading /)
+SKILL_SLUG=$(printf '%s' "$SKILL" | sed 's|^/||' | tr -c 'a-zA-Z0-9._-' '_')
+
+if [[ "$RESUME" == true ]]; then
+  # Find most recent run for this skill
+  RUN_DIR=$(ls -1d "$RUNS_DIR"/${SKILL_SLUG}_*/  2>/dev/null | sort -r | head -1 || true)
+  if [[ -z "$RUN_DIR" ]] || [[ ! -d "$RUN_DIR" ]]; then
+    log_error "No previous run found for skill: $SKILL"
+    exit 1
+  fi
+  # Trim trailing slash
+  RUN_DIR="${RUN_DIR%/}"
+
+  # Load workdir from run metadata if not specified
+  if [[ -z "$WORKDIR" ]] && [[ -f "$RUN_DIR/meta.json" ]]; then
+    WORKDIR=$(jq -r '.workdir // ""' "$RUN_DIR/meta.json")
+  fi
+
+  log_info "Resuming run: $RUN_DIR"
+else
+  # Need at least one input source
+  if [[ ${#INPUTS[@]} -eq 0 ]] && [[ -z "$INPUT_FILE" ]]; then
+    log_error "No inputs provided. Use --input or --file"
+    show_usage
+    exit 1
+  fi
+
+  TIMESTAMP=$(date '+%Y-%m-%d_%H%M%S')
+  RUN_DIR="$RUNS_DIR/${SKILL_SLUG}_${TIMESTAMP}"
+  mkdir -p "$RUN_DIR/results"
+
+  # Build inputs list
+  if [[ ${#INPUTS[@]} -gt 0 ]]; then
+    printf '%s\n' "${INPUTS[@]}" > "$RUN_DIR/inputs.txt"
+  elif [[ -n "$INPUT_FILE" ]]; then
+    INPUT_FILE="${INPUT_FILE/#\~/$HOME}"
+    if [[ ! -f "$INPUT_FILE" ]]; then
+      log_error "Input file not found: $INPUT_FILE"
+      exit 1
+    fi
+    # Strip empty lines and whitespace
+    sed '/^[[:space:]]*$/d' "$INPUT_FILE" > "$RUN_DIR/inputs.txt"
+  fi
+
+  # Apply limit
+  if [[ "$LIMIT" -gt 0 ]]; then
+    head -n "$LIMIT" "$RUN_DIR/inputs.txt" > "$RUN_DIR/inputs_limited.txt"
+    mv "$RUN_DIR/inputs_limited.txt" "$RUN_DIR/inputs.txt"
+  fi
+
+  # Initialize progress file
+  touch "$RUN_DIR/progress.jsonl"
+
+  # Save run metadata
+  cat > "$RUN_DIR/meta.json" <<METAEOF
+{
+  "skill": "$SKILL",
+  "workdir": "$WORKDIR",
+  "model": "$MODEL",
+  "effort": "$EFFORT",
+  "max_turns": $MAX_TURNS,
+  "allowed_tools": "$ALLOWED_TOOLS",
+  "started_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+METAEOF
+fi
+
+# ── Set up logging ──────────────────────────────────────────────────────
+LOG_FILE="$RUN_DIR/run.log"
+touch "$LOG_FILE"
+
+# ── Dry run ─────────────────────────────────────────────────────────────
+TOTAL_INPUTS=$(wc -l < "$RUN_DIR/inputs.txt" | tr -d '[:space:]')
+ALREADY_DONE=$(get_completed_count "$RUN_DIR")
+REMAINING=$((TOTAL_INPUTS - ALREADY_DONE))
+
+echo ""
+echo "  skill-runner"
+echo "  ────────────────────────────────────"
+echo "  Skill:      $SKILL"
+echo "  Workdir:    $WORKDIR"
+echo "  Model:      $MODEL"
+echo "  Effort:     $EFFORT"
+echo "  Max turns:  $MAX_TURNS"
+echo "  ────────────────────────────────────"
+echo "  Inputs:     $TOTAL_INPUTS"
+[[ "$ALREADY_DONE" -gt 0 ]] && echo "  Completed:  $ALREADY_DONE (will skip)"
+echo "  To process: $REMAINING"
+echo "  Run dir:    $RUN_DIR"
+echo ""
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo "  Inputs:"
+  while IFS= read -r line; do
+    if is_completed "$RUN_DIR" "$line" 2>/dev/null; then
+      echo "    [skip] $line"
+    else
+      echo "    [ -- ] $line"
+    fi
+  done < "$RUN_DIR/inputs.txt"
+  echo ""
+  echo "  (dry run — nothing executed)"
+  echo ""
+
+  # Clean up empty run dir if we just created it
+  if [[ "$RESUME" == false ]] && [[ ! -s "$RUN_DIR/progress.jsonl" ]]; then
+    rm -rf "$RUN_DIR"
+  fi
+  exit 0
+fi
+
+# ── Monitor hint ────────────────────────────────────────────────────────
+echo "  To monitor in another terminal:"
+echo "  python3 $SCRIPT_DIR/dashboard.py $RUN_DIR"
+echo ""
+
+# ── Run ─────────────────────────────────────────────────────────────────
+log_info "Run started"
+
+# Trap Ctrl+C for clean summary
+trap 'echo ""; log_warn "Interrupted — printing summary"; sound_interrupted; print_summary "$RUN_DIR"; exit 130' INT
+
+run_batch "$RUN_DIR"
+
+# ── Final summary ───────────────────────────────────────────────────────
+print_summary "$RUN_DIR"
