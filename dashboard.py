@@ -89,6 +89,22 @@ def format_duration(secs: int | float) -> str:
     return f"{secs}s"
 
 
+def calc_wall_clock(entries: list[dict]) -> int:
+    """Calculate wall clock seconds from first running to last completed timestamp."""
+    timestamps = []
+    for e in entries:
+        ts = e.get("timestamp", "")
+        if ts and e.get("status") in ("running", "completed", "failed"):
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                timestamps.append(dt)
+            except Exception:
+                continue
+    if len(timestamps) < 2:
+        return sum(e.get("duration_s", 0) for e in entries if e.get("status") in ("completed", "failed"))
+    return max(0, int((max(timestamps) - min(timestamps)).total_seconds()))
+
+
 def is_run_complete(entries: list[dict], total_inputs: int) -> bool:
     """Check if all inputs have a terminal status."""
     if total_inputs == 0:
@@ -125,7 +141,7 @@ def build_interrupted_screen(meta: dict, entries: list[dict], total_inputs: int)
     n_done = len(completed) + len(failed)
     remaining = total_inputs - n_done
 
-    total_duration = sum(e.get("duration_s", 0) for e in completed + failed)
+    total_duration = calc_wall_clock(entries)
     total_cost = sum(e.get("cost_usd", 0) for e in status_map.values())
     total_turns = sum(e.get("turns", 0) for e in status_map.values())
 
@@ -212,7 +228,7 @@ def build_complete_screen(meta: dict, entries: list[dict], total_inputs: int) ->
     completed = [e for e in entries if e.get("status") == "completed"]
     failed = [e for e in entries if e.get("status") == "failed"]
 
-    total_duration = sum(e.get("duration_s", 0) for e in completed + failed)
+    total_duration = calc_wall_clock(entries)
     total_cost = sum(e.get("cost_usd", 0) for e in entries)
     total_turns = sum(e.get("turns", 0) for e in entries)
     avg_duration = total_duration / len(completed) if completed else 0
@@ -290,8 +306,12 @@ def build_display(
     filled = int(bar_width * n_done / total_inputs) if total_inputs > 0 else 0
     bar = "[green]" + "\u2588" * filled + "[/green]" + "[dim]" + "\u2591" * (bar_width - filled) + "[/dim]"
 
-    # ETA calculation
-    total_duration = sum(e.get("duration_s", 0) for e in completed + failed)
+    # ETA calculation — use wall clock for runtime, but per-task avg for ETA
+    total_duration = calc_wall_clock(entries)
+    avg_task_duration = (
+        sum(e.get("duration_s", 0) for e in completed + failed) / n_done
+        if n_done > 0 else 0
+    )
     avg_duration = total_duration / n_done if n_done > 0 else 0
     eta_secs = int(avg_duration * remaining)
     eta_str = format_duration(eta_secs) if n_done > 0 else "calculating..."
@@ -318,7 +338,7 @@ def build_display(
 
     cost_str = f"${total_cost:.4f}"
     stats_text = (
-        f"  API equiv:     {cost_str:<20}Avg duration: {format_duration(int(avg_duration))}\n"
+        f"  API equiv:     {cost_str:<20}Avg/task:     {format_duration(int(avg_task_duration))}\n"
         f"  Total turns:   {total_turns:<20}Avg turns:    {avg_turns:.1f}\n"
         f"  Total runtime: {runtime_str:<20}Est remaining: {format_duration(eta_secs)}"
     )
