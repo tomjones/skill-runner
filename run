@@ -8,6 +8,7 @@ source "$SCRIPT_DIR/lib/log.sh"
 source "$SCRIPT_DIR/lib/progress.sh"
 source "$SCRIPT_DIR/lib/runner.sh"
 source "$SCRIPT_DIR/lib/sounds.sh"
+source "$SCRIPT_DIR/lib/ratelimit.sh"
 
 # ── Defaults (overridden by .env, then by CLI flags) ────────────────────
 MODEL="opus"

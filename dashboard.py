@@ -454,6 +454,12 @@ def build_display(
                 started_str,
                 elapsed_str,
             )
+        elif status == "paused":
+            icon = "[yellow]\u23f8[/yellow]"
+            task_table.add_row(
+                str(row_num), icon, f"[yellow]{inp}[/yellow]",
+                "[yellow]rate limited[/yellow]", "", "", started_str, "",
+            )
         else:
             task_table.add_row(
                 str(row_num), " ", inp, status, "", "", "", "",

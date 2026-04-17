@@ -118,8 +118,17 @@ _run_worker() {
     log_success "[$idx/$total] DONE: $input  (${last_turns} turns, $(format_duration "$last_dur"), \$${last_cost})"
     sound_task_completed
   else
-    log_error "[$idx/$total] FAILED: $input"
-    sound_task_failed
+    # Check if it was a rate limit error — mark as paused instead of failed
+    local safe_name
+    safe_name=$(echo "$input" | tr -c 'a-zA-Z0-9._-' '_')
+    local result_file="$run_dir/results/${safe_name}.jsonl"
+    if is_rate_limit_error "$result_file"; then
+      log_warn "[$idx/$total] RATE LIMITED: $input — will retry after reset"
+      mark_status "$run_dir" "$input" "paused" "0" "0" "0" ""
+    else
+      log_error "[$idx/$total] FAILED: $input"
+      sound_task_failed
+    fi
   fi
 }
 
@@ -140,7 +149,22 @@ run_batch_sequential() {
       continue
     fi
 
+    # Proactive rate limit check
+    local rl_status rl_reset
+    read -r rl_status rl_reset <<< "$(check_rate_limit "$run_dir")"
+    if [[ "$rl_status" == "blocked" || "$rl_status" == "rejected" ]]; then
+      log_warn "Rate limit blocked — waiting for reset"
+      wait_for_reset "$rl_reset"
+    fi
+
     _run_worker "$input" "$run_dir" "$current" "$total"
+
+    # If last worker was paused (rate limited), wait and retry
+    if grep -q "\"input\":\"${input}\".*\"paused\"" "$run_dir/progress.jsonl" 2>/dev/null; then
+      read -r rl_status rl_reset <<< "$(check_rate_limit "$run_dir")"
+      wait_for_reset "$rl_reset"
+      _run_worker "$input" "$run_dir" "$current" "$total"
+    fi
 
   done < "$inputs_file"
 }
@@ -192,8 +216,24 @@ run_batch_parallel() {
     done
     active_pids=("${still_alive[@]+"${still_alive[@]}"}")
 
-    # Launch workers up to max_jobs
-    while [[ $active_count -lt $max_jobs ]] && [[ $next -lt $queue_len ]]; do
+    # Launch workers up to max_jobs (with rate limit awareness)
+    local effective_max=$max_jobs
+    while [[ $active_count -lt $effective_max ]] && [[ $next -lt $queue_len ]]; do
+      # Proactive rate limit check before each launch
+      local rl_status rl_reset
+      read -r rl_status rl_reset <<< "$(check_rate_limit "$run_dir")"
+
+      if [[ "$rl_status" == "blocked" || "$rl_status" == "rejected" ]]; then
+        log_warn "Rate limit blocked — waiting for reset before launching more"
+        # Let in-flight workers finish, then wait
+        wait 2>/dev/null
+        active_pids=()
+        active_count=0
+        wait_for_reset "$rl_reset"
+        effective_max=$max_jobs  # restore full parallelism after reset
+        continue
+      fi
+
       local inp="${queue[$next]}"
       local idx="${queue_idx[$next]}"
       next=$((next + 1))
@@ -213,6 +253,60 @@ run_batch_parallel() {
 
   # Wait for any remaining workers
   wait 2>/dev/null
+
+  # Re-queue any paused inputs (rate limited during this run)
+  local -a paused_inputs=()
+  local -a paused_idx=()
+  for i in "${!queue[@]}"; do
+    local inp="${queue[$i]}"
+    if grep -q "\"input\":\"${inp}\".*\"paused\"" "$run_dir/progress.jsonl" 2>/dev/null; then
+      if ! is_completed "$run_dir" "$inp"; then
+        paused_inputs+=("$inp")
+        paused_idx+=("${queue_idx[$i]}")
+      fi
+    fi
+  done
+
+  if [[ ${#paused_inputs[@]} -gt 0 ]]; then
+    log_info "${#paused_inputs[@]} inputs were rate-limited — retrying after reset"
+    local rl_status rl_reset
+    read -r rl_status rl_reset <<< "$(check_rate_limit "$run_dir")"
+    wait_for_reset "$rl_reset"
+
+    queue=("${paused_inputs[@]}")
+    queue_idx=("${paused_idx[@]}")
+    queue_len=${#queue[@]}
+    next=0
+    active_pids=()
+    active_count=0
+
+    # Re-run the parallel loop for paused inputs
+    while [[ $next -lt $queue_len ]] || [[ $active_count -gt 0 ]]; do
+      local -a still_alive=()
+      active_count=0
+      for p in "${active_pids[@]}"; do
+        [[ -z "$p" ]] && continue
+        if kill -0 "$p" 2>/dev/null; then
+          still_alive+=("$p")
+          active_count=$((active_count + 1))
+        fi
+      done
+      active_pids=("${still_alive[@]+"${still_alive[@]}"}")
+
+      while [[ $active_count -lt $max_jobs ]] && [[ $next -lt $queue_len ]]; do
+        local inp="${queue[$next]}"
+        local idx="${queue_idx[$next]}"
+        next=$((next + 1))
+        _run_worker "$inp" "$run_dir" "$idx" "$total" &
+        active_pids+=("$!")
+        CHILD_PIDS+=("$!")
+        active_count=$((active_count + 1))
+        sleep 2
+      done
+      sleep 2
+    done
+    wait 2>/dev/null
+  fi
 }
 
 # ── Entry point ─────────────────────────────────────────────────────────
